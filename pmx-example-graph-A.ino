@@ -1,6 +1,6 @@
-// SDS011 Air Quality Monitor
+// seeed wio-terminal combined with grove sen55 to monitor air-quality on the lcd screen of the wio-terminal
+// adapted from SDS011 Air Quality Monitor
 // --------------------------
-// Optionally, used in conjunction with PC Server/plotter application at (c) vwlowen.co.uk
 //
 // Adapted from SDS011 Sensor libray by R. Zschiegner (rz@madavi.de).
 // adjusted by hanscees@hanscees.com for wio-terminal with seeed sens55 all-in-one air quality monitor
