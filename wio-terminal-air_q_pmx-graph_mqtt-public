@@ -1,0 +1,858 @@
+// seeed wio-terminal combined with grove sen55 to monitor air-quality on the lcd screen of the wio-terminal
+//
+//  About Wio terminal: https://wiki.seeedstudio.com/Wio-Terminal-Getting-Started/
+//  About air-monitor all-in-one https://wiki.seeedstudio.com/Grove_SEN5X_All_in_One/
+//
+// Adapted by hanscees@hanscees.com 12-2022 from several scripts combined 
+//
+//  script one was for SDS011 Air Quality Monitor
+//                 Adapted from SDS011 Sensor libray by R. Zschiegner (rz@madavi.de).
+//             adjusted by hanscees@hanscees.com for wio-terminal with seeed sens55 all-in-one air quality monitor
+//             changes: many mainly because old code paused device 5 minutes between readings, sen55 not
+//             also got rid of fancy fonts cause they stink (make things far more difficult)
+//
+//  script two on MQTT by  Samuel M. - v1.1 - 08.2016
+//               https://github.com/mertenats/open-home-automation
+//               All the MQTT code was very usefull
+//               changes also many because other sensor, and Json library went from version 5 to 6
+//               about MQTT https://mosquitto.org/man/mqtt-7.html
+//
+// before you can run this script on Wio terminal  you do need to update firmware wifi chip,
+//             see https://www.youtube.com/watch?v=mltJ0D0oppI
+//             and https://wiki.seeedstudio.com/Wio-Terminal-Getting-Started/ 
+//
+//   Libraries :
+//    - PubSubClient : https://github.com/knolleary/pubsubclient
+//    - ArduinoJson : https://github.com/bblanchon/ArduinoJson
+//    - Arduino SensirionI2CSen5x.h : https://github.com/Sensirion/arduino-i2c-sen5x
+
+// added LCD screen coordinates to code R01 - R14 to understand where what texts are on wio-terminal tft screen
+
+// 0   |--------------------------------|--------------------------------320
+//     |
+//     |   R04 ->--------------------------------------------------
+//     |   | R7        R10             R05                     R12
+//     |   | R8        R11   R02->
+// 120 |   -                  |
+//     |
+//     |
+//     |
+//     |
+//     |  R13                                                        R01
+// 240 ------------------------------------------------------------------320
+
+
+#include <Arduino.h>  // arduino library
+#include <SensirionI2CSen5x.h>  // seeed sens55 library (sensorion air quality sensors)
+#include <Wire.h>   // for i2c sensors
+#include <TFT_eSPI.h>  // tft library
+#include "rpcWiFi.h" //Wi-Fi library
+#include <PubSubClient.h>  // MQTT library
+#include <ArduinoJson.h>  // Json library
+
+// dont use sprites with rpcWiFi.h it wont work see 
+// https://forum.seeedstudio.com/t/blank-lcd-after-include-rpcwifi-h/259082/10
+// #include"Free_Fonts.h" // fonts  // couldnt get this to work, loaded file into sketch by hand
+
+
+/*
+ * Constant & Variable Declarations
+ */
+
+// counter mqtt publish
+// we only publish every 12 cycles, we draw lines on lcd every cycle (5 seconds)
+int publish_timeout = 0; // so this is a counter
+
+
+// Network Settings
+ // wifi credentials - please change username and password
+ const char *ssid     = "hansbees_5G";
+ const char *password = "Noshit,droptables&yes";   
+ // MQTT settings
+ #define MQTT_VERSION MQTT_VERSION_3_1_1
+ const char *ID = "HCS2023-Wi-Term1";
+ // MQTT: topic
+ const char* MQTT_SENSOR_TOPIC = "livingroom/sensors/HCS-Wi-Term1";
+
+ // MQTT broker - please change IP, username and password
+ const char* mqttServer     = "mqqt.hansbees.com";   
+ const int   mqttPort       =  1883;
+ // const char* mqttUser       = "username"; // we dont use password, but ID 
+ // const char* mqttPassword   = "password"; // since wifi is protected well enough
+
+
+// sensor variables 
+int loopCount = 0;
+String quality;                                           // Define PM2.5 value as LOW, MEDIUM etc (UK Defra scale).
+int colour;                                               // Define PM2.5 value as colour (UK Defra scale)
+
+                           // ####################  in this array the PM2.5  bargraph data lives !! 
+short pm25Array[320];                                  // Array to hold sensor values for the histogram.
+float p10, p25;                                       // Variabled for PM10 and PM2.5 data from sensor.
+int error;                                           // Confirms valid data from sensor. 0 = error.
+short arrayPointer = 15;                            // Array element currently being written to (16-bit integer)
+int yPos;                                          // Vertical marker for bar chart.
+int sleepSeconds;  // we dont use this? 
+
+// some volt variable for fun and profit
+float volts = 0.0;                                   // voltage 
+const float Vmax = 5.75;                             // Max voltage can be set here. Depends on resistor tolerances.
+
+// UK air pollution bands for PM2.5 and PM10 Particles.  
+// https://uk-air.defra.gov.uk/air-pollution/daqi?view=more-info&pollutant=pm25#pollutant
+
+#define LIGHT_GREEN  0x9FF3                               // Define colours used by UK Defra to specify pollutant bands.
+#define MID_GREEN    0x37E0
+#define DARK_GREEN   0x3660
+#define LIGHT_YELLOW 0xFFE0
+#define MID_YELLOW   0xFE60
+#define ORANGE       0xFCC0
+#define LIGHT_RED    0xFB2C
+#define MID_RED      0xF800
+#define DARK_RED     0x9800
+#define PURPLE       0xC99F
+
+
+
+
+// make objects? 
+WiFiClient wclient;                                // wifi object
+PubSubClient client(wclient);                     // Setup MQTT client  
+SensirionI2CSen5x sen5x;                          //  sensor
+TFT_eSPI tft;                                    //initialize TFT LCD         
+
+
+
+/*-------------------------------------------------------------------------------*/
+/* Function void publishData    (and callback as well)                            */
+/*                                                                               */
+/* TASK    : publish json data to MQTT server                                     */
+/* UPDATE  : 30.12.2022                                                          */
+/*-------------------------------------------------------------------------------*/
+
+// function called to publish diverse measurements
+
+void publishData(float massConcentrationPm2p5, float massConcentrationPm10p0, float ambientTemperature, 
+float ambientHumidity, float vocIndex, float noxIndex) {
+  // create a JSON object
+  // doc : https://github.com/bblanchon/ArduinoJson/wiki/API%20Reference
+  StaticJsonDocument<800> root;    ///  todo is this big enough?
+  // old JsonObject root = <jsonDoc>();
+
+  // old StaticJsonBuffer<800> jsonBuffer;    ///  todo is this big enough?
+  // old JsonObject& root = jsonBuffer.createObject();
+  // INFO: the data must be converted into a string; a problem occurs when using floats...
+  root["temp"] = (String)ambientTemperature;
+  root["humid"] = (String)ambientHumidity;
+  root["VOC"] = (String)vocIndex;
+  root["NOx"] = (String)noxIndex;
+  root["PM25"] = (String)massConcentrationPm2p5;;
+  root["PM10"] = (String)massConcentrationPm10p0;
+  // old root.prettyPrintTo(Serial);
+  serializeJsonPretty(root, Serial);
+  Serial.println("");
+  /*
+     {
+        "temperature": "23.20" ,
+        "humidity": "43.70"
+     }
+  */
+  char data[800];  // todo is this big enough? made it 800 from 200 original
+  // old root.printTo(data, root.measureLength() + 1);
+  serializeJson(root, data, measureJson(root) + 1);
+  client.publish(MQTT_SENSOR_TOPIC, data, true);
+  yield();
+}
+
+// function called when a MQTT message arrived
+void callback(char* p_topic, byte* p_payload, unsigned int p_length) {
+}
+
+
+
+/*-------------------------------------------------------------------------------*/
+/* Function void millisDelay(int duration)                                       */
+/*                                                                               */
+/* TASK    : timer                                                               */
+/* UPDATE  : 06.03.2021                                                          */
+/*-------------------------------------------------------------------------------*/
+void millisDelay(int duration) 
+{
+    long timestart = millis();
+    while ((millis()-timestart) < duration) {};
+}
+
+
+/*-------------------------------------------------------------------------------*/
+/* Function void setup_wifi(void)                                                */
+/*                                                                               */
+/* TASK    : do not pr ovide a wifi hotspot                                      */
+/* UPDATE  : 31.12.2022                                                          */
+/* added some code if wifi has a longer problem so it wont block                 */
+/*-------------------------------------------------------------------------------*/
+
+void setup_wifi() 
+{
+  
+  int wifi_timeout = 0;
+
+  Serial.println(" Connecting to ");
+  Serial.println(ssid);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) 
+  {
+    delay(2000);
+    wifi_timeout++;
+    Serial.print(".");
+    if(wifi_timeout > 10) {
+       break;
+    } 
+  }
+  if  (WiFi.status() == WL_CONNECTED) {
+    Serial.println();
+    Serial.println(" [x] WiFi connected");
+    Serial.print(" [?] IP address: ");
+    Serial.println(WiFi.localIP());
+    millisDelay(1000);
+    }
+  else {
+    Serial.println(" [0] WiFi NOT connected");
+    Serial.println("Please try again later");
+  }
+}
+
+/*-------------------------------------------------------------------------------*/
+/* Function void reconnect()                                                     */
+/*                                                                               */
+/* TASK    : mqtt reconnect to server                                            */
+/* UPDATE  : 06.03.2021                                                          */
+/* boolean connect (clientID, [username, password], [willTopic, willQoS,         */
+/* willRetain, willMessage], [cleanSession])                                    */
+/*-------------------------------------------------------------------------------*/
+
+void reconnect() 
+{
+  while (!client.connected()) 
+  {
+  //  if (client.connect(ID,mqttUser, mqttPassword)) 
+    if (client.connect(ID))
+    {
+      Serial.println("MTTQ IS ONline"); 
+    } else 
+    {
+      Serial.println("MTTQ IS Offline, waiting 5 secs"); 
+      Serial.println("ERROR: failed, rc=");
+      Serial.print(client.state());
+      millisDelay(5000);
+      // todo make it non blocking
+    }
+  }
+}
+
+
+
+
+
+/*-------------------------------------------------------------------------------*/
+/* Function void plothistogram                                                   */
+/*                                                                               */
+/* TASK    : Draw PM2.5 histogram on Wio terminal LCD screen                     */
+/* UPDATE  : 06.03.2021                                                          */
+/*-------------------------------------------------------------------------------*/
+
+
+
+//  ##############################  draw histogram bargraph  ########################
+// todo dont understand constrain line and sqrt: value is stored *10 ????
+// this function was original to get an array from storage after pausing the device
+// but we dont pause this sens55 device since it can run for 10 years sais the specs
+
+void plotHistogram() {                                    // Function to re-draw the histogram.
+   tft.fillRect(15,120, 319, 90, ILI9341_BLACK);          // Clear plotting area
+
+   byte line;
+   for (int i = 15; i <= 319;  i++){
+      getTextData25(pm25Array[i] / 10);                   // Get colour corrsponding to each air quality level. Value is stored
+                                                          // multiplied by 10 so divide by 10 here to get true value.                        
+      line = constrain(sqrt(pm25Array[i]*40), 0, 105);    // Calculate length of line to plot. sqrt compresses higher values.
+     tft.drawFastVLine(i, 225 - line, line,  colour);     // Draw vertical line in chosen colour.
+   }
+}
+
+
+/*-------------------------------------------------------------------------------         */
+/* Function getTextData25                                                                */
+/*                                                                                      */
+/* TASK    : Draw PM2.5 histogram on Wio terminal LCD screen                           */
+/* UPDATE  : 30.12.2022                                                               */
+/*  input is PM2.5 uq/m3 value that is measures by the sensor                        */
+/* Function sets three global variables: 'Ypos' (vertical cursor position),         */
+/* 'quality' and returns half the length text string 'quality' whose value         */ 
+/* (was) is used to centre justify the text on the display.                             */
+/*-------------------------------------------------------------------------------*/
+
+
+// UK air pollution bands for PM2.5 and PM10 Particles.  
+// https://uk-air.defra.gov.uk/air-pollution/daqi?view=more-info&pollutant=pm25#pollutant
+
+int getTextData25(int value) {                                 
+  switch (value) {                                             
+    case 0 ... 11 : yPos = 100; colour = LIGHT_GREEN; quality = "1 LOW"; break;  
+    case 12 ... 23 : yPos = 90; colour = MID_GREEN; quality = "2 LOW"; break;        
+    case 24 ... 35 : yPos = 80; colour = DARK_GREEN; quality = "3 LOW"; break;     
+    case 36 ... 41 : yPos = 70; colour = LIGHT_YELLOW; quality = "4 MODERATE"; break;
+    case 42 ... 47 : yPos = 60; colour = MID_YELLOW; quality = "5 MODERATE"; break;
+    case 48 ... 53 : yPos = 50; colour = ORANGE; quality = "6 MODERATE";  break;
+    case 54 ... 58 : yPos = 40; colour = LIGHT_RED;  quality = "7 HIGH"; break;
+    case 59 ... 64 : yPos = 30; colour = MID_RED;  quality = "8 HIGH"; break;
+    case 65 ... 70 : yPos = 20; colour = DARK_RED;  quality = "9 HIGH"; break;  
+    case 71 ... 9999: yPos = 10; colour = PURPLE;  quality = "10 VERY HIGH"; break;   
+    default: yPos = 10; colour = ILI9341_MAGENTA;  quality = "HAZARDOUS"; break;
+  }  
+  return (quality.length() / 2) * 6;
+}                                         
+
+// same for PM10 but without Ypos, as there is no histogram for it
+int getTextDataPM10(int value) {
+  switch (value) {
+    case 0 ... 16 : colour = LIGHT_GREEN; quality = "1 LOW"; break;
+    case 17 ... 33 : colour = MID_GREEN; quality = "2 LOW"; break;
+    case 34 ... 50 :  colour = DARK_GREEN; quality = "3 LOW"; break;
+    case 51 ... 58 : colour = LIGHT_YELLOW; quality = "4 MODERATE"; break;
+    case 59 ... 66 : colour = MID_YELLOW; quality = "5 MODERATE"; break;
+    case 67 ... 75 : colour = ORANGE; quality = "6 MODERATE";  break;
+    case 76 ... 83 : colour = LIGHT_RED;  quality = "7 HIGH"; break;
+    case 84 ... 91 : colour = MID_RED;  quality = "8 HIGH"; break;
+    case 92 ... 100 : colour = DARK_RED;  quality = "9 HIGH"; break;  
+    case 101 ... 9999: colour = PURPLE;  quality = "10 VERY HIGH"; break;   
+    default: colour = ILI9341_MAGENTA;  quality = "HAZARDOUS"; break;
+  }
+   return (quality.length() / 2) * 6;
+}
+
+
+/*-------------------------------------------------------------------------------*/
+/* Function void printSerialNumber                                               */
+/*                                                                               */
+/* TASK    : give serial of air-quality sensor sen55                             */
+/* UPDATE  : 06.03.2021                                                          */
+/*-------------------------------------------------------------------------------*/
+
+// this does not seem to work, so I dont use it
+void printSerialNumber() {
+    uint16_t error;
+    char errorMessage[256];
+    unsigned char serialNumber[32];
+    uint8_t serialNumberSize = 32;
+
+    error = sen5x.getSerialNumber(serialNumber, serialNumberSize);
+    if (error) {
+        Serial.print("Error trying to execute getSerialNumber(): ");
+        errorToString(error, errorMessage, 256);
+        Serial.println(errorMessage);
+    } else {
+        Serial.print("SerialNumber:");
+        Serial.println((char*)serialNumber);
+    }
+}
+
+
+/*-------------------------------------------------------------------------------*/
+/* Function void printSerialNumber                                               */
+/*                                                                               */
+/* TASK    : give serial of air-quality sensor sen55                             */
+/* UPDATE  : 06.03.2021                                                          */
+/*-------------------------------------------------------------------------------*/
+
+
+void setup() {
+
+
+
+// start up serial device, if connected to computer. If not, forget it, no problem
+  int serial_timeout = 0;
+  Serial.begin(115200);
+
+  while (!Serial) {
+     delay(100);
+     serial_timeout++;
+     if(serial_timeout > 100) {
+       break;
+    }
+   } 
+
+Serial.println("hi, just started serial device");
+delay(5000);
+
+// why not get the sen55 serial number
+// printSerialNumber();  // doesnt work, whatever
+
+
+  tft.begin(); 
+  tft.setRotation(1); 
+  tft.setTextWrap(true);
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setTextSize(1);
+ 
+
+// Connect to WiFi & Establish Server
+Serial.println("beginning wifi sequence");
+ setup_wifi();  // using function above
+  
+ // Connect to MQTT and subscribe topic messages
+ client.setServer(mqttServer, mqttPort);
+ client.setCallback(callback);  // hmmmm todo?
+
+
+
+
+// print LCD screen labels first row on top: PM10, voltage, PM2.5 and temperature.  
+ Serial.println("wifi done, lets print static labels");
+
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setCursor(15, tft.height() -20);
+  tft.setTextSize(1);                                         // Print static labels and headers on display.
+  tft.setCursor(150, 10);
+  tft.println("PM 2.5");
+  tft.setCursor(150, 17);
+  tft.print("ug/m3");
+  tft.setCursor(5, 10);
+  tft.print("PM 10"); 
+  tft.setCursor(5, 17);
+  tft.print("ug/m3"); 
+
+  tft.fillRect(312, 10, 6, 10, PURPLE);                        // Print a colour key for the Defra pollutant bands right corner.
+  tft.fillRect(312, 20, 6, 10, DARK_RED);                      // and down along the edge of the screen
+  tft.fillRect(312, 30, 6, 10, MID_RED);                       // a little triangle points to the quality color
+  tft.fillRect(312, 40, 6, 10, LIGHT_RED);
+  tft.fillRect(312, 50, 6, 10, ORANGE);
+  tft.fillRect(312, 60, 6, 10, MID_YELLOW);
+  tft.fillRect(312, 70, 6, 10, LIGHT_YELLOW);
+  tft.fillRect(312, 80, 6, 10, DARK_GREEN);
+  tft.fillRect(312, 90, 6, 10, MID_GREEN);
+  tft.fillRect(312, 100, 6, 10, LIGHT_GREEN);
+  
+  Serial.println("polluted bands are on screen now, see? ");
+//  delay(5000);
+
+
+  tft.drawFastVLine(13, 120, 108, ILI9341_BLUE);          // Draw histogram vertical axis
+  tft.setTextColor(ILI9341_BLUE);                        // why only till 50, pm2.5 can be 350 ?
+  tft.setCursor(0, 120);                                // todo, beam me up scotty, this planet sucks
+  tft.print(" ^");
+  tft.setCursor(0, 130);
+  tft.print("50"); 
+  tft.setCursor(0, 170);
+  tft.print("10"); 
+  tft.setCursor(0, 200);
+  tft.print(" 1");
+
+  // it actually uses tft.height and tft.width 
+  tft.drawFastHLine(12, tft.height() - 14, tft.width()-1, ILI9341_BLUE);     // Draw histogram horizontal axis
+  for (int x = 319; x > 15; x-=12) {
+     tft.drawFastVLine(x, 227, 3, ILI9341_BLUE);                             // Draw 1-hour ticks on horizontal axis.
+  }
+
+  tft.setTextColor(ILI9341_BLUE);
+  tft.setCursor(105, 232); 
+  tft.print("Air Quality Monitor");  // quality scale goes from 1 LOW to hazardous
+
+  Serial.println("histogram axis have been drawn, see? ");
+//   delay(5000);
+
+// draw wifi status on screen, cause why not ? 
+   int rssi = WiFi.RSSI();
+
+   tft.setCursor(0,  232); 
+   tft.fillRect(0, 232, 50, 8, ILI9341_BLACK);
+   tft.setTextSize(1);
+
+   if (WiFi.status() == WL_CONNECTED) {
+     tft.setTextColor(ILI9341_BLUE);
+     tft.print("RSSI " + String(rssi) + " dB");
+   } else {
+     tft.setTextColor(ILI9341_RED);
+     tft.print("No WiFi");
+     Serial.println("NO WIFI ");    
+   }
+   
+
+// lets see if the sensor works , function to use
+  tft.setTextColor(ILI9341_GREEN);
+  tft.setTextSize(2);  // watch out todo
+  
+// now start sensor sens55
+  Serial.println("starting sensor, blieb blieb ? ");
+  Wire.begin();
+  sen5x.begin(Wire);
+  uint16_t error;
+  char errorMessage[256];
+  error = sen5x.deviceReset();
+  if (error) {
+        Serial.print("Error sensor sen55 trying to execute deviceReset(): ");
+        errorToString(error, errorMessage, 256);
+        Serial.println(errorMessage);
+    }
+
+  Serial.println("if sens55 errors, you should see that now, plotting begins for the first time ");
+ //  delay(5000);
+
+// first time we plot histogram, since we dont save it after a current outage it will be empty
+  plotHistogram();
+                                    
+// Adjust tempOffset to account for additional temperature offsets
+// exceeding the SEN module's self heating.
+    float tempOffset = 0.0;
+    error = sen5x.setTemperatureOffsetSimple(tempOffset);
+    if (error) {
+        Serial.print("Error trying to execute setTemperatureOffsetSimple(): ");
+        errorToString(error, errorMessage, 256);
+        Serial.println(errorMessage);
+    } else {
+        Serial.println("Temperature Offset set to ");
+        Serial.print(tempOffset);
+        Serial.println(" deg. Celsius (SEN54/SEN55 only");
+    }
+
+// Start Measurement
+    error = sen5x.startMeasurement();
+    if (error) {
+        Serial.println("Error trying to execute sen55 startMeasurement(): ");
+        errorToString(error, errorMessage, 256);
+        Serial.println(errorMessage);
+    }
+    Serial.println("starting void loop: it runs continuously from now on ");
+}
+
+void loop() {
+
+  Serial.println("We just looped again, isnt it glorious!  ");
+ 
+  tft.setTextSize(1);                                     //
+  tft.setCursor(248, 232);   
+  tft.setTextColor(ILI9341_GREEN, ILI9341_BLACK);
+  tft.print("SAMPLING ");  
+
+  delay(5000);                                           // delay in loop. 5 seconds
+
+
+  //  get voltage info, actually works on wio terminal 
+  int raw = 0;                                             // Get supply voltage. Useful when battery operated.
+  for (byte i=0;i<10;i++) {
+    raw += analogRead(A0);
+    delay(10);
+  }
+  raw = raw / 10;
+  float volts = (raw / 1023.0) * Vmax;
+
+  // print voltage to LCD, before printing we black out the area  
+  // See the Rxx coordinates in the beginning of this ino script 
+  tft.fillRect(248, 232, 70, 10, ILI9341_BLACK); //  R01 right below: where sampling was printed: 
+  tft.fillRect(85, 105, 65, 8, ILI9341_BLACK);   // R02 ?? central text probably we dont use
+  
+  
+
+  uint16_t error;
+  char errorMessage[256];
+
+//    delay(1000);
+
+// Read Measurement air quality sensor sen55
+    float massConcentrationPm1p0;
+    float massConcentrationPm2p5;
+    float massConcentrationPm4p0;
+    float massConcentrationPm10p0;
+    float ambientHumidity;
+    float ambientTemperature;
+    float vocIndex;
+    float noxIndex;
+
+    error = sen5x.readMeasuredValues(
+        massConcentrationPm1p0, massConcentrationPm2p5, massConcentrationPm4p0,
+        massConcentrationPm10p0, ambientHumidity, ambientTemperature, vocIndex,
+        noxIndex);
+
+    if (error) {
+        Serial.println("Error trying to execute readMeasuredValues(): ");
+        errorToString(error, errorMessage, 256);
+        Serial.println(errorMessage);
+    } else {
+        Serial.print("MassConcentrationPm1p0:");
+        Serial.print(massConcentrationPm1p0);
+        Serial.print("\t");
+        Serial.print("MassConcentrationPm2p5:");
+        Serial.print(massConcentrationPm2p5);
+        Serial.print("\t");
+        Serial.print("MassConcentrationPm4p0:");
+        Serial.print(massConcentrationPm4p0);
+        Serial.print("\t");
+        Serial.print("MassConcentrationPm10p0:");
+        Serial.print(massConcentrationPm10p0);
+        Serial.print("\t");
+        Serial.print("AmbientHumidity:");
+        if (isnan(ambientHumidity)) {
+            Serial.print("n/a");
+        } else {
+            Serial.print(ambientHumidity);
+        }
+        Serial.print("\t");
+        Serial.print("AmbientTemperature:");
+        if (isnan(ambientTemperature)) {
+            Serial.print("n/a");
+        } else {
+            Serial.print(ambientTemperature);
+        }
+        Serial.print("\t");
+        Serial.print("VocIndex:");
+        if (isnan(vocIndex)) {
+            Serial.print("n/a");
+        } else {
+            Serial.print(vocIndex);
+        }
+        Serial.print("\t");
+        Serial.print("NoxIndex:");
+        if (isnan(noxIndex)) {
+            Serial.println("n/a");
+        } else {
+            Serial.println(noxIndex);
+        }
+    }
+
+
+// so we have the air quality variables filled up by measuring
+// lets print them on the Wio terminal LCD screen 
+ 
+
+
+/*-------------------------------------------------------------------------------         */
+/* Function getTextData25                                                                */
+/*                                                                                      */
+/* TASK    : Draw PM2.5 histogram on Wio terminal LCD screen                           */
+/* UPDATE  : 30.12.2022                                                               */
+/*  input is PM2.5 uq/m3 value that is measures by the sensor                        */
+/* Function sets three global variables: 'Ypos' (vertical cursor position),         */
+/* 'quality' and returns half the length text string 'quality' whose value         */ 
+/* (was) is used to centre justify the text on the display.                       */
+/*-------------------------------------------------------------------------------*/
+
+
+// on the basis of the PM2.5 value we just measured, lets look up quality hazard color, and ypos and text 
+int x = getTextData25(massConcentrationPm2p5); // yields quality (from 1 low to hazardous) and colour and Ypos
+
+// print some debug variables 
+//   Serial.print("what is x now? (some )");  // yields 12 mostly when low, 36 when high . Debug
+//   Serial.println(x);                // debug
+                                        
+  // use color for text: so if air quality is not good, text becomes red and so on                                  
+   tft.setTextColor(colour);                                            
+                                                                  
+// triangles point right-above where we are in the pmX scaling (green or red or.. )                                    
+   tft.fillRect(305, 10, 5, 105, ILI9341_BLACK);                        // Clear old triangle
+   tft.fillTriangle(305, yPos, 308, yPos+5, 305, yPos+10, colour);      // Plot new position of triangle on colour scale
+   
+
+   // #############################################################
+  // print middle top screen pm2.5 values ########################
+ // First clear display areas where new text will 
+// be drawn. (Graphical fonts don't overwrite  previous text.
+
+   tft.fillRect(100, 40, 110, 8, ILI9341_BLACK);   // R03 volt?                       
+   tft.fillRect(0, 36, 285, 77, ILI9341_BLACK);   // black out coordinate R04 all above histogram?   
+   
+// rectange is drawn like coordinate 1, (width, height), length horizontal line, lenhth vertical line )
+// duh, I knew that
+
+// ok here we use the quality text pixel length 
+    tft.setCursor(165 - x, 40);     // pm2.5 above         // Set cursor to centre of display area.
+    tft.print(quality);  // R05 air quality scale goes from 1 LOW to hazardous: shows pm 2.5 in center above
+    tft.setTextSize(2);
+    String sp25 = String(massConcentrationPm2p5);
+ //  String sp25 = String(p25);                                           // Convert PM2.5 value to text because the
+                                                                        // 'getTextBounds' function needs text.
+ 
+// write pm 2.5 in the middle above, bit bigger
+   tft.setCursor(165 - x, 50);  // R06 = pm2.5 conc txt
+   tft.print(massConcentrationPm2p5, 1);
+   tft.setTextSize(1);
+   
+   // print on screen pm10 left upper corner
+   tft.setTextColor(colour, ILI9341_BLACK);                              // PM10 data is less-used so just print it
+   tft.fillRect(0, 30, 100, 10, ILI9341_BLACK);   // R07                // in the top left corner of the display.
+   tft.setCursor(0, 40);
+   tft.print(quality);                                                // R08 quality pm10 left corner
+   tft.setTextSize(2);
+   tft.fillRect(0, 55, 60, 20, ILI9341_BLACK);                      // first erase old text
+   tft.setCursor(2, 55);                                           // R09 coordinate
+   tft.print(massConcentrationPm10p0, 1);                         // R09 conc pm10 left corner, bigger 
+
+  Serial.println("just printed pm10 see ? ");
+//  delay(5000);
+
+// print volt 
+   tft.setTextSize(1); 
+   tft.setTextColor(ILI9341_GREEN);
+   tft.fillRect(80, 10, 50, 10, ILI9341_BLACK);        // r10 rectangle volt
+   tft.setCursor(80, 10);                             //r11  coordinate
+   tft.print(volts);                                 // R11 volts 
+   tft.print("v");                                  // r11
+
+ // Serial.println("just printed volts now see? ");
+ // delay(5000);
+
+
+   
+
+// lets write temperature and humidity for fun and profit to R12
+   tft.fillRect(245, 10, 30, 10, ILI9341_BLACK);                          // r12  right corner till 275, so 35 left unknown why 
+   tft.setTextColor(TFT_ORANGE);
+   tft.setCursor(245, 10);                                               // r12  coordinate
+   tft.print(ambientTemperature);                                       // R12 temperature
+   tft.print(" C");                                                    // r12 
+
+   tft.setTextColor(TFT_BLUE);
+   tft.fillRect(80, 30, 30, 10, ILI9341_BLACK);                      // r10 rectangle volt
+   tft.setCursor(80, 30);                                           //r14  coordinate
+   tft.print(ambientHumidity);                                     // R14 humidity 
+   tft.print(" Hum");                                             // r14 
+
+// lets write VOC and NOX  for fun and profit to R12 
+   tft.setTextColor(TFT_YELLOW);
+   tft.fillRect(80, 50, 30, 10, ILI9341_BLACK);                // r10 rectangle volt
+   tft.setCursor(80, 50);                                     //r15  coordinate
+
+// some dark compiler stuff, I want to get rid of float and show an integer (ie 1, and not 1.00 )
+// hope Im doing ok ? 
+   int voc_int = static_cast<int>(vocIndex);               // getting rid of unpredictable float lengths  messing up my screen
+
+   tft.print(voc_int);                                    // R15 VOx 
+   tft.print(" VOC");                                    // r15 
+
+   tft.setTextColor(TFT_RED);
+   tft.fillRect(245, 25, 30, 10, ILI9341_BLACK);          // r10 rectangle volt
+   tft.setCursor(245, 25);                               //r14  coordinate
+// float to integer 
+   int nox_int = static_cast<int>(noxIndex);
+   tft.print(nox_int);                                 // R14 NOx 
+   tft.print(" NO");                                  // r14
+//  ambientHumidity, ambientTemperature, vocIndex,  noxIndex);
+
+
+// ====== plot histogram (bar graph) ==============
+
+   if (arrayPointer >= 319) {                              // If array has been filled, move all values down one.
+     for (int i = 15; i <= 319; i++) {
+       pm25Array[i] = pm25Array[i+1];
+     }
+   }
+ 
+ // stuff pm25 into array, but times 10 to save memory probably 
+   pm25Array[arrayPointer] = (short) (massConcentrationPm2p5 * 10);           // Multiply float value by 10 to make short integer.
+   plotHistogram();                                                          // this is probably where screen flickers , hmm 
+   if (arrayPointer < 319) arrayPointer++;                                  // Increment the pointer to store the next value.
+   delay(100);
+ 
+ //======= end plot ====================
+
+// Get the WiFi signal strength and print on the display.
+   int rssi = WiFi.RSSI();                                   
+   tft.setCursor(0,  232); 
+   tft.fillRect(0, 232, 50, 8, ILI9341_BLACK);                        // R13  left below corner
+   tft.setTextSize(1);
+   
+   if (WiFi.status() == WL_CONNECTED) {
+     tft.setTextColor(ILI9341_BLUE);
+     tft.print(" RSSI " + String(rssi) + " dB");
+   } else {
+     tft.setTextColor(ILI9341_RED);
+     tft.print(" No WiFi");    
+     // might be an idea to reconnect too no? wifi
+     if (publish_timeout > 11) {                                     // we only try this once a minute max
+       Serial.println("try to restart wifi connection now ");
+       setup_wifi();  // using function above
+     }
+     Serial.println("beginning wifi sequence");
+ setup_wifi();  // using function above
+   }
+ 
+
+// time for sending the MQTT messages via WIFI toward home assistant (HA).
+// we will stuff all measurements in one big Json text string and send them away to be remembered elsewhere
+
+ // check if all connections are stable
+  if (!client.loop()) reconnect();   // make this non-blocking first please
+
+
+/*
+ *
+  // MQTT Communication
+  // see https://pubsubclient.knolleary.net/api
+  // boolean publish (topic, payload, [length], [retained])
+  Configuration (HA) :
+    sensor 1:
+      platform: mqtt
+      state_topic: 'livingroom/sensors/HCS2023-Wi-Term1'
+      name: 'temp'
+      unit_of_measurement: '°C'
+      value_template: '{{ value_json.temperature }}'
+    
+    sensor 2:
+      platform: mqtt
+      state_topic: 'livingroom/sensors/HCS2023-Wi-Term1'
+      name: 'humid'
+      unit_of_measurement: '%'
+      value_template: '{{ value_json.humidity }}'
+
+// other stuff {"temp":"19.77","humid":"63.14","VOC":"101.00","NOx":"1.00","PM25":"5.50","PM10":"5.70"}
+
+ *
+ */
+
+//test run
+// float Pm2p5 = 12.4;
+// float Pm10 = 13.2;
+// float Temp = 19.01;
+// float Humid = 45;
+// float voc = 3.35;
+// float nox = 0.1;
+// publishData(Pm2p5, Pm10, Temp, Humid, voc, nox);  /////  publish !
+
+// Read Measurement air quality sensor sen55
+//    float massConcentrationPm1p0;
+//    float massConcentrationPm2p5;
+//    float massConcentrationPm4p0;
+//    float massConcentrationPm10p0;
+//    float ambientHumidity;
+//    float ambientTemperature;
+//    float vocIndex;
+//    float noxIndex;
+
+// hmm, I want a line on the lcd histogram every 5 seconds
+// but only post to mttq every minute 
+// so lets publish every 12 cycles here
+
+publish_timeout++;
+if(publish_timeout > 11) {
+   publish_timeout = 0;
+   publishData(massConcentrationPm2p5, massConcentrationPm10p0, ambientTemperature, ambientHumidity, vocIndex, noxIndex);
+   /////  publish !
+}
+
+ 
+// publishData(massConcentrationPm2p5, massConcentrationPm10p0, ambientTemperature, ambientHumidity, vocIndex, noxIndex);
+  /////  publish !
+
+// ok, it will publish every 5 seconds or so, that is a bit much no? 
+// lets make that 30 seconds
+millisDelay(5000);
+
+Serial.println("Now at the end of loop, publish counter is  ");
+Serial.println(publish_timeout);
+	
+  }
+ 
+
+ // Serial.print("Heap size at end of loop ");
+ // Serial.println(system_get_free_heap_size() );         // Free  memory check!
+
+  
