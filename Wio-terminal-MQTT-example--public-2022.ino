@@ -12,19 +12,17 @@ feel free to copy-paste and improve
     - ArduinoJson : https://github.com/bblanchon/ArduinoJson
 
     Configuration (HA) :
-    sensor 1:
-      platform: mqtt
-      state_topic: 'office/sensor1'
-      name: 'Temperature'
+mqtt:
+  sensor:
+    - name: 'temp_livingroom'
+      state_topic: 'livingroom/sensors/HCS2023-Wi-Term1'
       unit_of_measurement: '°C'
-      value_template: '{{ value_json.temperature }}'
-    
-    sensor 2:
-      platform: mqtt
-      state_topic: 'office/sensor1'
-      name: 'Humidity'
+      value_template: '{{ value_json.temp }}'
+    - name: 'humidity_livingroom'
+      state_topic: 'livingroom/sensors/HCS2023-Wi-Term1'
+      name: 'humidity_livingroom'
       unit_of_measurement: '%'
-      value_template: '{{ value_json.humidity }}'
+      value_template: '{{ value_json.humid }}'
  * 
  */
 #include <rpcWiFi.h>
